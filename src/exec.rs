@@ -3,7 +3,8 @@
 //   - passthrough        : stdin/stdout/stderr 完全継承。エディタ起動も生きる
 //   - handle_read        : fresh = 即返却。stale = 古い body を即返して裏で refresh を kick
 //                          miss = 同期 gh + 保存。
-//   - handle_write       : passthrough + 終了コード 0 のときだけ invalidate
+//   - handle_write       : passthrough + 終了コード 0 のときだけ invalidate。
+//                          drop した行は write-through で daemon に再取得を投げる
 //   - refresh_into_cache : chd / detached subprocess から呼ばれる裏更新本体
 
 use anyhow::{Context, Result};
@@ -17,7 +18,7 @@ use crate::invalidate;
 use crate::ipc::{self, Message};
 use crate::key;
 use crate::router;
-use crate::store::{Entry, Store};
+use crate::store::{Entry, RefreshTarget, Store};
 
 /// gh を stdio 完全透過で起動する。終了コードを返す。
 pub fn passthrough(argv: &[String]) -> Result<i32> {
@@ -100,7 +101,12 @@ pub fn handle_write(store: &Store, argv: &[String], cfg: &Config) -> Result<i32>
 
     let code = passthrough(argv)?;
     if code == 0 {
-        invalidate::run(store, argv)?;
+        // 1) 関連 cache を drop しつつ、write-through で再取得したい argv を集める
+        let targets = invalidate::run(store, argv)?;
+        // 2) 集めた argv を daemon に投げて非同期に gh で取り直す（fire-and-forget）
+        for t in targets {
+            kick_write_through_refresh(&t);
+        }
     }
     Ok(code)
 }
@@ -152,7 +158,11 @@ pub fn run_async_exec(argv: &[String]) -> Result<()> {
 
     // 成功時: Write 系なら cache を吹き飛ばす（Passthrough は何が変わったか分からないので触らない）
     if matches!(router::classify(argv), router::Action::Write) {
-        invalidate::run(&store, argv)?;
+        let targets = invalidate::run(&store, argv)?;
+        // daemon 内なので IPC を経由せず、refresh は別スレッドで直接走らせる
+        for t in targets {
+            spawn_local_refresh(t);
+        }
     }
     Ok(())
 }
@@ -213,6 +223,43 @@ fn kick_background_refresh(argv: &[String], kind: &str, ttl: u64, cache_key: &st
     // IPC fail → daemon を裏で立ち上げて、今回は subprocess で代行する
     daemon::ensure_running();
     spawn_refresh_subprocess(argv).ok();
+}
+
+/// Write 成功後の write-through 再取得を daemon にお願いする。
+/// drop された entry の argv をそのまま使うので、Read whitelist にヒットしたものだけが
+/// 届いている前提（drop 元が cache テーブル＝Read 経路で put された行なので保証される）。
+fn kick_write_through_refresh(target: &RefreshTarget) {
+    let argv: Vec<String> = match serde_json::from_str(&target.argv_json) {
+        Ok(v) => v,
+        Err(_) => return, // 壊れた argv_json は捨てる。stale が残るより mass 化したくないので無視
+    };
+    let msg = Message::Refresh {
+        argv: argv.clone(),
+        cache_kind: target.kind.clone(),
+        ttl_secs: target.ttl_secs,
+        cache_key: target.cache_key.clone(),
+    };
+    if ipc::try_send(&msg) {
+        return;
+    }
+    // daemon が居なければ立てて、今回分は自分の copy を detached で代行
+    daemon::ensure_running();
+    spawn_refresh_subprocess(&argv).ok();
+}
+
+/// daemon 内部用の write-through 再取得。IPC を経由せず別スレッドで直接 gh を回す。
+fn spawn_local_refresh(target: RefreshTarget) {
+    let argv: Vec<String> = match serde_json::from_str(&target.argv_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    std::thread::spawn(move || {
+        if let Err(e) =
+            refresh_into_cache(&argv, &target.kind, target.ttl_secs, &target.cache_key)
+        {
+            eprintln!("chd: write-through refresh 失敗: {e:#}");
+        }
+    });
 }
 
 /// `ch --refresh ARGV...` を detached で起動する。親 ch はすぐ終わってよい。
