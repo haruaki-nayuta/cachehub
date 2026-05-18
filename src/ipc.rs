@@ -23,6 +23,10 @@ pub enum Message {
         ttl_secs: u64,
         cache_key: String,
     },
+    /// async_passthrough モードでの fire-and-forget な gh 実行依頼。
+    /// chd が gh を実行し、失敗時のみ exec_errors に記録する。
+    /// Write 系で成功した場合は cache invalidate もデーモン側で走らせる。
+    AsyncExec { argv: Vec<String> },
     /// 生存確認。daemon は何もしないで読み捨てる。
     Ping,
     /// `ch daemon stop` から送られる。daemon は素直に exit する。
@@ -43,8 +47,9 @@ pub fn send(msg: &Message) -> Result<()> {
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("daemon に繋がらない: {}", path.display()))?;
-    // 書き込みが詰まると ch のレイテンシを潰すので短めの timeout
-    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+    // 書き込みが詰まると ch のレイテンシを潰すので短めの timeout。
+    // AsyncExec で長い argv (--body "<長文>" 等) を流すケースのため Refresh より少し長めに取る。
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
     let mut line = serde_json::to_vec(msg)?;
     line.push(b'\n');
     stream.write_all(&line)?;

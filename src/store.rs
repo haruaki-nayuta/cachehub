@@ -33,6 +33,17 @@ pub struct KindRow {
     pub hits: i64,
 }
 
+/// async_passthrough モードで daemon が gh を実行して失敗したときの記録。
+/// stdout/stderr は大き過ぎると DB を圧迫するので保存時に 64KiB で頭打ちにする。
+pub struct ExecError {
+    pub id: i64,
+    pub argv_json: String,
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub failed_at: u64,
+}
+
 impl Store {
     /// `$CH_DB_PATH` か、未指定なら `~/.cache/ch/ch.db` を開く。
     pub fn open_default() -> Result<Self> {
@@ -183,6 +194,74 @@ impl Store {
         Ok(())
     }
 
+    /// async exec が失敗した記録を 1 件挿入する。
+    /// stdout/stderr は MAX_LOG_BYTES で頭打ち。
+    pub fn log_exec_error(
+        &self,
+        argv_json: &str,
+        exit_code: i32,
+        stdout: &[u8],
+        stderr: &[u8],
+        failed_at: u64,
+    ) -> Result<i64> {
+        let so = cap_log(stdout);
+        let se = cap_log(stderr);
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO exec_errors (argv_json, exit_code, stdout, stderr, failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        stmt.execute(params![argv_json, exit_code, so, se, failed_at as i64])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 新しい順で最大 `limit` 件取り出す。
+    pub fn list_exec_errors(&self, limit: usize) -> Result<Vec<ExecError>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, argv_json, exit_code, stdout, stderr, failed_at \
+             FROM exec_errors ORDER BY failed_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(ExecError {
+                    id: r.get(0)?,
+                    argv_json: r.get(1)?,
+                    exit_code: r.get(2)?,
+                    stdout: r.get(3)?,
+                    stderr: r.get(4)?,
+                    failed_at: r.get::<_, i64>(5)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// 1 件詳細を引く。
+    pub fn get_exec_error(&self, id: i64) -> Result<Option<ExecError>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, argv_json, exit_code, stdout, stderr, failed_at \
+             FROM exec_errors WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(ExecError {
+                id: row.get(0)?,
+                argv_json: row.get(1)?,
+                exit_code: row.get(2)?,
+                stdout: row.get(3)?,
+                stderr: row.get(4)?,
+                failed_at: row.get::<_, i64>(5)? as u64,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 失敗ログを全削除。
+    pub fn clear_exec_errors(&self) -> Result<usize> {
+        let n = self.conn.execute("DELETE FROM exec_errors", [])?;
+        Ok(n)
+    }
+
     /// 直近 `within_secs` 秒以内に触られた repo を新しい順で返す（プリフェッチ対象）。
     pub fn active_repos(&self, within_secs: u64, now: u64) -> Result<Vec<(String, u64)>> {
         let threshold = now.saturating_sub(within_secs);
@@ -219,7 +298,33 @@ CREATE TABLE IF NOT EXISTS repo_activity (
     repo      TEXT PRIMARY KEY,
     last_used INTEGER NOT NULL
 );
+
+-- async_passthrough モードで daemon が回した gh の失敗ログ。
+-- ch errors で参照する。
+CREATE TABLE IF NOT EXISTS exec_errors (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    argv_json  TEXT    NOT NULL,
+    exit_code  INTEGER NOT NULL,
+    stdout     BLOB    NOT NULL,
+    stderr     BLOB    NOT NULL,
+    failed_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exec_errors_failed_at ON exec_errors(failed_at);
 "#;
+
+/// exec_errors に保存する stdout/stderr の上限。
+/// gh のエラー出力は通常数十〜数百バイトだが、`gh api` で巨大レスポンスを叩いた場合の保険。
+const MAX_LOG_BYTES: usize = 64 * 1024;
+
+fn cap_log(b: &[u8]) -> Vec<u8> {
+    if b.len() <= MAX_LOG_BYTES {
+        b.to_vec()
+    } else {
+        let mut v = b[..MAX_LOG_BYTES].to_vec();
+        v.extend_from_slice(b"\n... (truncated by ch)");
+        v
+    }
+}
 
 fn default_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("CH_DB_PATH") {
@@ -283,6 +388,43 @@ mod tests {
         assert!(s.get("k1").unwrap().is_none());
         assert!(s.get("k2").unwrap().is_some());
         assert!(s.get("k3").unwrap().is_none());
+    }
+
+    #[test]
+    fn exec_error_log_list_clear_roundtrip() {
+        let s = make_store();
+        let id1 = s
+            .log_exec_error("[\"issue\",\"close\",\"1\"]", 1, b"out1", b"err1", 100)
+            .unwrap();
+        let id2 = s
+            .log_exec_error("[\"pr\",\"merge\",\"2\"]", 128, b"", b"err2", 200)
+            .unwrap();
+        assert!(id1 < id2);
+
+        let rows = s.list_exec_errors(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // failed_at 降順なので id2 が先
+        assert_eq!(rows[0].id, id2);
+        assert_eq!(rows[0].exit_code, 128);
+        assert_eq!(rows[0].stderr, b"err2");
+
+        let one = s.get_exec_error(id1).unwrap().unwrap();
+        assert_eq!(one.stdout, b"out1");
+
+        let n = s.clear_exec_errors().unwrap();
+        assert_eq!(n, 2);
+        assert!(s.list_exec_errors(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exec_error_truncates_large_payload() {
+        let s = make_store();
+        let big = vec![b'x'; 70 * 1024];
+        let id = s.log_exec_error("[]", 1, b"", &big, 0).unwrap();
+        let got = s.get_exec_error(id).unwrap().unwrap();
+        // 64KiB + truncation marker
+        assert!(got.stderr.len() <= 64 * 1024 + 64);
+        assert!(got.stderr.ends_with(b"(truncated by ch)"));
     }
 
     #[test]

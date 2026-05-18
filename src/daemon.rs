@@ -119,6 +119,14 @@ fn process(msg: Message, stop_flag: &Arc<AtomicBool>) {
                 }
             });
         }
+        Message::AsyncExec { argv } => {
+            // CLI 側は既に 0 を返して抜けている。ここで gh を回し、失敗は exec_errors に積む
+            thread::spawn(move || {
+                if let Err(e) = exec::run_async_exec(&argv) {
+                    eprintln!("chd: async exec 失敗: {e:#}");
+                }
+            });
+        }
         Message::Ping => {
             // liveness 用。何もしない
         }

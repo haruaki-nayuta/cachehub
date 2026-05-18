@@ -11,10 +11,12 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::Config;
 use crate::daemon;
 use crate::invalidate;
 use crate::ipc::{self, Message};
 use crate::key;
+use crate::router;
 use crate::store::{Entry, Store};
 
 /// gh を stdio 完全透過で起動する。終了コードを返す。
@@ -86,16 +88,73 @@ pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64)
 }
 
 /// Write 経路。gh を透過で実行し、成功時のみ invalidate。
-pub fn handle_write(store: &Store, argv: &[String]) -> Result<i32> {
+/// config.async_passthrough が true なら daemon に投げて即 0 を返す（fire-and-forget）。
+pub fn handle_write(store: &Store, argv: &[String], cfg: &Config) -> Result<i32> {
     // Write も「触ったリポ」なので LRU を更新
     let now = epoch_secs();
     mark_active(store, argv, now).ok();
+
+    if cfg.async_passthrough && offload_to_daemon(argv) {
+        return Ok(0);
+    }
 
     let code = passthrough(argv)?;
     if code == 0 {
         invalidate::run(store, argv)?;
     }
     Ok(code)
+}
+
+/// 通常 Passthrough 経路。config.async_passthrough が true なら daemon に投げて即 0 を返す。
+pub fn handle_passthrough(argv: &[String], cfg: &Config) -> Result<i32> {
+    if cfg.async_passthrough && offload_to_daemon(argv) {
+        return Ok(0);
+    }
+    passthrough(argv)
+}
+
+/// daemon に AsyncExec を投げる。daemon が居なければ false を返してフォールバック判断に使う。
+fn offload_to_daemon(argv: &[String]) -> bool {
+    daemon::ensure_running();
+    ipc::try_send(&Message::AsyncExec {
+        argv: argv.to_vec(),
+    })
+}
+
+/// daemon 側の AsyncExec ワーカー本体。
+///
+/// gh を実行し、
+///   - exit_code != 0 なら stdout/stderr ごと exec_errors に積む
+///   - exit_code == 0 で argv が Write 系なら cache を invalidate する
+pub fn run_async_exec(argv: &[String]) -> Result<()> {
+    let output = Command::new("gh")
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("gh を起動できなかった (async exec)")?;
+
+    let code = output.status.code().unwrap_or(1);
+    let store = Store::open_default()?;
+
+    if code != 0 {
+        let argv_json = serde_json::to_string(argv).unwrap_or_default();
+        store.log_exec_error(
+            &argv_json,
+            code,
+            &output.stdout,
+            &output.stderr,
+            epoch_secs(),
+        )?;
+        return Ok(());
+    }
+
+    // 成功時: Write 系なら cache を吹き飛ばす（Passthrough は何が変わったか分からないので触らない）
+    if matches!(router::classify(argv), router::Action::Write) {
+        invalidate::run(&store, argv)?;
+    }
+    Ok(())
 }
 
 /// SWR の裏更新本体。
