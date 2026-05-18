@@ -6,12 +6,15 @@
 //   3. `CH_BYPASS=1`        → 全部素通し
 //   4. `ch cache ...`       → 内部サブコマンド（stats / purge）
 //   5. `ch daemon ...`      → 内部サブコマンド（status / stop）
-//   6. 引数なし             → gh のヘルプ
-//   7. その他               → router で Read / Write / Passthrough に分類
+//   6. `ch errors ...`      → async exec の失敗ログ参照
+//   7. 引数なし             → gh のヘルプ
+//   8. その他               → router で Read / Write / Passthrough に分類
 
 mod cache_cli;
+mod config;
 mod daemon;
 mod daemon_cli;
+mod errors_cli;
 mod exec;
 mod invalidate;
 mod ipc;
@@ -64,12 +67,18 @@ fn run() -> Result<i32> {
         return daemon_cli::handle(&args[1..]);
     }
 
-    // 6. 引数なし
+    // 6. 内部: errors（async exec の失敗ログ参照）
+    if args.first().map(|s| s.as_str()) == Some("errors") {
+        return errors_cli::handle(&args[1..]);
+    }
+
+    // 7. 引数なし
     if args.is_empty() {
         return exec::passthrough(&args);
     }
 
-    // 7. 通常経路
+    // 8. 通常経路
+    let cfg = config::Config::load();
     let store = store::Store::open_default()?;
 
     // daemon が居なければ立ち上げる（fire-and-forget、待たない）
@@ -77,8 +86,8 @@ fn run() -> Result<i32> {
 
     match router::classify(&args) {
         router::Action::Read { kind, ttl } => exec::handle_read(&store, &args, kind, ttl),
-        router::Action::Write => exec::handle_write(&store, &args),
-        router::Action::Passthrough => exec::passthrough(&args),
+        router::Action::Write => exec::handle_write(&store, &args, &cfg),
+        router::Action::Passthrough => exec::handle_passthrough(&args, &cfg),
     }
 }
 
