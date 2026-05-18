@@ -171,6 +171,32 @@ impl Store {
         };
         Ok(n)
     }
+
+    /// アクティブリポジトリ LRU の更新（spec §6.B「自動LRU」）。
+    /// `--repo owner/name` か、無ければ cwd パスを ID として記録する。
+    pub fn mark_active(&self, id: &str, now: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO repo_activity (repo, last_used) VALUES (?1, ?2) \
+             ON CONFLICT(repo) DO UPDATE SET last_used = ?2",
+            params![id, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 直近 `within_secs` 秒以内に触られた repo を新しい順で返す（プリフェッチ対象）。
+    pub fn active_repos(&self, within_secs: u64, now: u64) -> Result<Vec<(String, u64)>> {
+        let threshold = now.saturating_sub(within_secs);
+        let mut stmt = self.conn.prepare(
+            "SELECT repo, last_used FROM repo_activity \
+             WHERE last_used > ?1 ORDER BY last_used DESC",
+        )?;
+        let rows: Vec<(String, u64)> = stmt
+            .query_map(params![threshold as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -187,6 +213,12 @@ CREATE TABLE IF NOT EXISTS cache (
 CREATE INDEX IF NOT EXISTS idx_cache_kind        ON cache(kind);
 CREATE INDEX IF NOT EXISTS idx_cache_repo_kind   ON cache(repo, kind);
 CREATE INDEX IF NOT EXISTS idx_cache_fetched_at  ON cache(fetched_at);
+
+-- spec §6.B: アクティブリポジトリの LRU。`ch` 起動のたびに upsert される
+CREATE TABLE IF NOT EXISTS repo_activity (
+    repo      TEXT PRIMARY KEY,
+    last_used INTEGER NOT NULL
+);
 "#;
 
 fn default_path() -> Result<PathBuf> {

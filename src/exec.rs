@@ -1,15 +1,19 @@
-// gh の起動経路。Read / Write / Passthrough の 3 種類。
+// gh の起動経路。Read / Write / Passthrough の 3 種類 + SWR 用の refresh worker。
 //
-//   - passthrough: stdin/stdout/stderr 完全継承。エディタ起動も生きる
-//   - handle_read: ヒットなら body をそのまま流す。miss/期限切れは gh exec → SQLite に保存
-//   - handle_write: passthrough + 終了コード 0 のときだけ invalidate を走らせる
+//   - passthrough        : stdin/stdout/stderr 完全継承。エディタ起動も生きる
+//   - handle_read        : fresh = 即返却。stale = 古い body を即返して裏で refresh を kick
+//                          miss = 同期 gh + 保存。
+//   - handle_write       : passthrough + 終了コード 0 のときだけ invalidate
+//   - refresh_into_cache : chd / detached subprocess から呼ばれる裏更新本体
 
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::daemon;
 use crate::invalidate;
+use crate::ipc::{self, Message};
 use crate::key;
 use crate::store::{Entry, Store};
 
@@ -25,24 +29,35 @@ pub fn passthrough(argv: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-/// Read 経路。
+/// Read 経路（SWR 対応）。
 ///
-/// v0.1 では SWR は実装せず、期限切れも miss と同じ扱いにする（同期 fetch）。
-/// SWR は v0.1.1 で追加予定。
+///   fresh hit  → body を即返す
+///   stale hit  → body を即返してから refresh を裏で kick（IPC → fallback で detached subprocess）
+///   miss       → gh を同期実行して保存
 pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64) -> Result<i32> {
     let k = key::cache_key(argv);
     let now = epoch_secs();
 
+    // アクティブリポジトリ LRU の更新（spec §6.B）
+    mark_active(store, argv, now).ok();
+
     if let Some(entry) = store.get(&k)? {
-        if now.saturating_sub(entry.fetched_at) < entry.ttl_secs {
-            // fresh: 即返却
+        let age = now.saturating_sub(entry.fetched_at);
+        if age < entry.ttl_secs {
+            // fresh hit
             std::io::stdout().write_all(&entry.body)?;
             store.bump_hit(&k)?;
             return Ok(0);
         }
+
+        // stale: 先に古いやつを返して、裏で更新を走らせる
+        std::io::stdout().write_all(&entry.body)?;
+        store.bump_hit(&k)?;
+        kick_background_refresh(argv, kind, ttl, &k);
+        return Ok(0);
     }
 
-    // miss / 期限切れ: gh を同期 exec して stdout を捕まえる
+    // miss: 同期で gh を呼ぶ
     let output = Command::new("gh")
         .args(argv)
         .stdin(Stdio::null())
@@ -72,6 +87,10 @@ pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64)
 
 /// Write 経路。gh を透過で実行し、成功時のみ invalidate。
 pub fn handle_write(store: &Store, argv: &[String]) -> Result<i32> {
+    // Write も「触ったリポ」なので LRU を更新
+    let now = epoch_secs();
+    mark_active(store, argv, now).ok();
+
     let code = passthrough(argv)?;
     if code == 0 {
         invalidate::run(store, argv)?;
@@ -79,7 +98,94 @@ pub fn handle_write(store: &Store, argv: &[String]) -> Result<i32> {
     Ok(code)
 }
 
-fn epoch_secs() -> u64 {
+/// SWR の裏更新本体。
+///
+/// chd のワーカースレッドから直接呼ばれる経路と、
+/// `ch --refresh ...` のフォールバック subprocess から呼ばれる経路、両方の出口。
+/// gh を同期実行し、終了コード 0 なら cache を上書きする。
+pub fn refresh_into_cache(
+    argv: &[String],
+    kind: &str,
+    ttl_secs: u64,
+    cache_key: &str,
+) -> Result<()> {
+    let output = Command::new("gh")
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .context("gh を起動できなかった（refresh worker）")?;
+
+    if output.status.code() != Some(0) {
+        // 非ゼロ終了はキャッシュしない。stale を残したほうがマシ
+        return Ok(());
+    }
+
+    let store = Store::open_default()?;
+    let entry = Entry {
+        argv_json: serde_json::to_string(argv).unwrap_or_default(),
+        kind: kind.to_string(),
+        repo: key::detect_repo(argv),
+        body: output.stdout,
+        fetched_at: epoch_secs(),
+        ttl_secs,
+    };
+    store.put(cache_key, &entry)?;
+    Ok(())
+}
+
+/// 裏更新を走らせる：
+///   1) chd に IPC で投げる（fire-and-forget）
+///   2) IPC が失敗したら自分のコピーを `--refresh` で detached spawn
+///   3) ついでに daemon を auto-spawn して次回以降に備える
+fn kick_background_refresh(argv: &[String], kind: &str, ttl: u64, cache_key: &str) {
+    let msg = Message::Refresh {
+        argv: argv.to_vec(),
+        cache_kind: kind.to_string(),
+        ttl_secs: ttl,
+        cache_key: cache_key.to_string(),
+    };
+
+    if ipc::try_send(&msg) {
+        return;
+    }
+
+    // IPC fail → daemon を裏で立ち上げて、今回は subprocess で代行する
+    daemon::ensure_running();
+    spawn_refresh_subprocess(argv).ok();
+}
+
+/// `ch --refresh ARGV...` を detached で起動する。親 ch はすぐ終わってよい。
+fn spawn_refresh_subprocess(argv: &[String]) -> Result<()> {
+    let exe = std::env::current_exe().context("current_exe を取得できない")?;
+    use std::os::unix::process::CommandExt;
+    Command::new(&exe)
+        .arg("--refresh")
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("refresh subprocess の spawn 失敗")?;
+    Ok(())
+}
+
+/// `--repo` があればその値、無ければ cwd の絶対パスを「触ったリポ」として記録する。
+fn mark_active(store: &Store, argv: &[String], now: u64) -> Result<()> {
+    let id = key::detect_repo(argv).or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+    });
+    if let Some(id) = id {
+        store.mark_active(&id, now)?;
+    }
+    Ok(())
+}
+
+pub fn epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
