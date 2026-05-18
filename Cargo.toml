@@ -1,0 +1,16 @@
+[package]
+name = "ch"
+version = "0.1.0"
+edition = "2021"
+description = "gh の Read だけをキャッシュして高速化する小さな CLI"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
