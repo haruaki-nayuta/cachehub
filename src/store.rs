@@ -4,7 +4,7 @@
 // v0.1 では 1 テーブルで済ませる（kind/repo/fetched_at にインデックス）。
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Row};
 use std::path::{Path, PathBuf};
 
 pub struct Entry {
@@ -142,14 +142,7 @@ impl Store {
                      WHERE kind = ?1 AND (repo = ?2 OR repo IS NULL)",
                 )?;
                 let rows = stmt
-                    .query_map(params![kind, r], |row| {
-                        Ok(RefreshTarget {
-                            cache_key: row.get(0)?,
-                            argv_json: row.get(1)?,
-                            kind: row.get(2)?,
-                            ttl_secs: row.get::<_, i64>(3)? as u64,
-                        })
-                    })?
+                    .query_map(params![kind, r], row_to_refresh_target)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             }
@@ -158,14 +151,7 @@ impl Store {
                     "SELECT key, argv_json, kind, ttl_secs FROM cache WHERE kind = ?1",
                 )?;
                 let rows = stmt
-                    .query_map(params![kind], |row| {
-                        Ok(RefreshTarget {
-                            cache_key: row.get(0)?,
-                            argv_json: row.get(1)?,
-                            kind: row.get(2)?,
-                            ttl_secs: row.get::<_, i64>(3)? as u64,
-                        })
-                    })?
+                    .query_map(params![kind], row_to_refresh_target)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 Ok(rows)
             }
@@ -274,16 +260,7 @@ impl Store {
              FROM exec_errors ORDER BY failed_at DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| {
-                Ok(ExecError {
-                    id: r.get(0)?,
-                    argv_json: r.get(1)?,
-                    exit_code: r.get(2)?,
-                    stdout: r.get(3)?,
-                    stderr: r.get(4)?,
-                    failed_at: r.get::<_, i64>(5)? as u64,
-                })
-            })?
+            .query_map(params![limit as i64], row_to_exec_error)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -296,14 +273,7 @@ impl Store {
         )?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(ExecError {
-                id: row.get(0)?,
-                argv_json: row.get(1)?,
-                exit_code: row.get(2)?,
-                stdout: row.get(3)?,
-                stderr: row.get(4)?,
-                failed_at: row.get::<_, i64>(5)? as u64,
-            }))
+            Ok(Some(row_to_exec_error(row)?))
         } else {
             Ok(None)
         }
@@ -329,6 +299,30 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+}
+
+/// `list_refresh_targets` の 2 アームで共有する row マッパー。
+/// SELECT 列順は `(key, argv_json, kind, ttl_secs)` 固定。
+fn row_to_refresh_target(row: &Row) -> rusqlite::Result<RefreshTarget> {
+    Ok(RefreshTarget {
+        cache_key: row.get(0)?,
+        argv_json: row.get(1)?,
+        kind: row.get(2)?,
+        ttl_secs: row.get::<_, i64>(3)? as u64,
+    })
+}
+
+/// `list_exec_errors` と `get_exec_error` で共有する row マッパー。
+/// SELECT 列順は `(id, argv_json, exit_code, stdout, stderr, failed_at)` 固定。
+fn row_to_exec_error(row: &Row) -> rusqlite::Result<ExecError> {
+    Ok(ExecError {
+        id: row.get(0)?,
+        argv_json: row.get(1)?,
+        exit_code: row.get(2)?,
+        stdout: row.get(3)?,
+        stderr: row.get(4)?,
+        failed_at: row.get::<_, i64>(5)? as u64,
+    })
 }
 
 const SCHEMA: &str = r#"
