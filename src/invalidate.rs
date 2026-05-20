@@ -20,7 +20,7 @@ use crate::store::{RefreshTarget, Store};
 /// 未知の Write が来た場合は何もせず空 Vec を返す（呼び出し側が is_write=true の
 /// ときだけここに来る前提なので通常は走らない）。
 pub fn run(store: &Store, argv: &[String]) -> Result<Vec<RefreshTarget>> {
-    let s: Vec<&str> = argv.iter().map(|x| x.as_str()).collect();
+    let s: Vec<&str> = argv.iter().map(String::as_str).collect();
     let repo = key::detect_repo(argv);
     let repo_ref = repo.as_deref();
 
@@ -51,7 +51,7 @@ mod tests {
     use crate::store::Entry;
 
     fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+        parts.iter().copied().map(String::from).collect()
     }
 
     fn open_tmp_store() -> Store {
@@ -71,7 +71,7 @@ mod tests {
         Entry {
             argv_json: argv_json.into(),
             kind: kind.into(),
-            repo: repo.map(|s| s.into()),
+            repo: repo.map(Into::into),
             body: b"x".to_vec(),
             fetched_at: 0,
             ttl_secs: 60,

@@ -41,7 +41,7 @@ mod tests {
     use super::*;
 
     fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+        parts.iter().copied().map(String::from).collect()
     }
 
     #[test]

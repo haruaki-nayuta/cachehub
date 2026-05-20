@@ -15,7 +15,7 @@ pub enum Action {
 }
 
 pub fn classify(argv: &[String]) -> Action {
-    let s: Vec<&str> = argv.iter().map(|x| x.as_str()).collect();
+    let s: Vec<&str> = argv.iter().map(String::as_str).collect();
 
     // Read 系: Some(kind) を返す関数で一発判定
     if let Some((kind, ttl)) = match_read(&s) {
@@ -86,7 +86,7 @@ mod tests {
     use super::*;
 
     fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+        parts.iter().copied().map(String::from).collect()
     }
 
     #[test]

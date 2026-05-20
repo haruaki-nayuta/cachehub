@@ -135,41 +135,23 @@ impl Store {
         kind: &str,
         repo: Option<&str>,
     ) -> Result<Vec<RefreshTarget>> {
-        match repo {
-            Some(r) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT key, argv_json, kind, ttl_secs FROM cache \
-                     WHERE kind = ?1 AND (repo = ?2 OR repo IS NULL)",
-                )?;
-                let rows = stmt
-                    .query_map(params![kind, r], row_to_refresh_target)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT key, argv_json, kind, ttl_secs FROM cache WHERE kind = ?1",
-                )?;
-                let rows = stmt
-                    .query_map(params![kind], row_to_refresh_target)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            }
-        }
+        let mut stmt = self.conn.prepare(
+            "SELECT key, argv_json, kind, ttl_secs FROM cache \
+             WHERE kind = ?1 AND (?2 IS NULL OR repo = ?2 OR repo IS NULL)",
+        )?;
+        let rows = stmt
+            .query_map(params![kind, repo], row_to_refresh_target)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// kind 単位で drop。repo を渡せばその repo と NULL（repo 不明）だけ drop。
     /// repo=None なら kind 全体を消す（保守的 invalidate）。
     pub fn drop_by_kind(&self, kind: &str, repo: Option<&str>) -> Result<usize> {
-        let affected = match repo {
-            Some(r) => self.conn.execute(
-                "DELETE FROM cache WHERE kind = ?1 AND (repo = ?2 OR repo IS NULL)",
-                params![kind, r],
-            )?,
-            None => self
-                .conn
-                .execute("DELETE FROM cache WHERE kind = ?1", params![kind])?,
-        };
+        let affected = self.conn.execute(
+            "DELETE FROM cache WHERE kind = ?1 AND (?2 IS NULL OR repo = ?2 OR repo IS NULL)",
+            params![kind, repo],
+        )?;
         Ok(affected)
     }
 
@@ -402,7 +384,7 @@ mod tests {
         Entry {
             argv_json: "[]".into(),
             kind: kind.into(),
-            repo: repo.map(|s| s.into()),
+            repo: repo.map(Into::into),
             body: body.to_vec(),
             fetched_at: 0,
             ttl_secs: 60,
@@ -481,7 +463,7 @@ mod tests {
         let mk = |kind: &str, repo: Option<&str>, argv_json: &str, ttl: u64| Entry {
             argv_json: argv_json.into(),
             kind: kind.into(),
-            repo: repo.map(|s| s.into()),
+            repo: repo.map(Into::into),
             body: b"-".to_vec(),
             fetched_at: 0,
             ttl_secs: ttl,

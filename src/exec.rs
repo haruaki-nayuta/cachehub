@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -257,7 +258,6 @@ fn spawn_local_refresh(target: RefreshTarget) {
 /// `ch --refresh ARGV...` を detached で起動する。親 ch はすぐ終わってよい。
 fn spawn_refresh_subprocess(argv: &[String]) -> Result<()> {
     let exe = std::env::current_exe().context("current_exe を取得できない")?;
-    use std::os::unix::process::CommandExt;
     Command::new(&exe)
         .arg("--refresh")
         .args(argv)

@@ -12,7 +12,7 @@ use crate::ipc::{self, Message};
 use crate::store::Store;
 
 pub fn handle(args: &[String]) -> Result<i32> {
-    match args.first().map(|s| s.as_str()) {
+    match args.first().map(String::as_str) {
         Some("status") => status(),
         Some("stop") => stop(),
         Some("start") => start(),
@@ -40,7 +40,7 @@ fn status() -> Result<i32> {
     println!("アクティブリポジトリ ({} 件, 直近72h):", active.len());
     for (repo, last_used) in active.iter().take(20) {
         let age_secs = exec::epoch_secs().saturating_sub(*last_used);
-        println!("  {:<60}  ({}s 前)", repo, age_secs);
+        println!("  {repo:<60}  ({age_secs}s 前)");
     }
     if active.len() > 20 {
         println!("  ... 他 {} 件", active.len() - 20);

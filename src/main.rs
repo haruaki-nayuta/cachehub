@@ -39,17 +39,14 @@ fn main() -> ExitCode {
 fn run() -> Result<i32> {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    // 1. chd モード（同一バイナリ）
-    if args.first().map(|s| s.as_str()) == Some("--daemon") {
-        daemon::run()?;
-        return Ok(0);
-    }
-
-    // 2. SWR 裏更新の subprocess
-    //    `ch --refresh ARGV...` を detached で呼んだときの行き先
-    if args.first().map(|s| s.as_str()) == Some("--refresh") {
-        let gh_argv: Vec<String> = args.iter().skip(1).cloned().collect();
-        return run_refresh(&gh_argv);
+    // 1-2. 同一バイナリの内部モード（CH_BYPASS の前に処理する：daemon 自身は素通り対象外）
+    match args.first().map(String::as_str) {
+        Some("--daemon") => {
+            daemon::run()?;
+            return Ok(0);
+        }
+        Some("--refresh") => return run_refresh(&args[1..]),
+        _ => {}
     }
 
     // 3. 脱出弁
@@ -57,19 +54,12 @@ fn run() -> Result<i32> {
         return exec::passthrough(&args);
     }
 
-    // 4. 内部: cache
-    if args.first().map(|s| s.as_str()) == Some("cache") {
-        return cache_cli::handle(&args[1..]);
-    }
-
-    // 5. 内部: daemon
-    if args.first().map(|s| s.as_str()) == Some("daemon") {
-        return daemon_cli::handle(&args[1..]);
-    }
-
-    // 6. 内部: errors（async exec の失敗ログ参照）
-    if args.first().map(|s| s.as_str()) == Some("errors") {
-        return errors_cli::handle(&args[1..]);
+    // 4-6. 内部サブコマンド
+    match args.first().map(String::as_str) {
+        Some("cache") => return cache_cli::handle(&args[1..]),
+        Some("daemon") => return daemon_cli::handle(&args[1..]),
+        Some("errors") => return errors_cli::handle(&args[1..]),
+        _ => {}
     }
 
     // 7. 引数なし
@@ -94,9 +84,9 @@ fn run() -> Result<i32> {
 /// `ch --refresh ARGV...` のエントリ。
 /// 渡された argv を router で再分類し、Read 系だったときだけ cache を上書きする。
 fn run_refresh(gh_argv: &[String]) -> Result<i32> {
-    let (kind, ttl) = match router::classify(gh_argv) {
-        router::Action::Read { kind, ttl } => (kind, ttl),
-        _ => return Ok(0), // Read じゃないものを refresh する意味は無い
+    let router::Action::Read { kind, ttl } = router::classify(gh_argv) else {
+        // Read じゃないものを refresh する意味は無い
+        return Ok(0);
     };
     let cache_key = key::cache_key(gh_argv);
     exec::refresh_into_cache(gh_argv, kind, ttl, &cache_key)?;

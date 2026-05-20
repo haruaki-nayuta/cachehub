@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use std::os::unix::process::CommandExt;
+
 use crate::exec;
 use crate::ipc::{is_alive, socket_path, Message};
 
@@ -151,7 +153,6 @@ pub fn ensure_running() {
         Ok(p) => p,
         Err(_) => return,
     };
-    use std::os::unix::process::CommandExt;
     let _ = std::process::Command::new(&exe)
         .arg("--daemon")
         .stdin(std::process::Stdio::null())
