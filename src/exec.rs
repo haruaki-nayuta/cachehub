@@ -74,19 +74,25 @@ pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64)
 
     // 4xx/5xx 相当はキャッシュしない（特に rate limit の 403 を焼き付けない）
     if code == 0 {
-        let entry = Entry {
-            argv_json: serde_json::to_string(argv).unwrap_or_default(),
-            kind: kind.to_string(),
-            repo: key::detect_repo(argv),
-            body: output.stdout.clone(),
-            fetched_at: now,
-            ttl_secs: ttl,
-        };
+        let entry = build_entry(argv, kind, output.stdout.clone(), now, ttl);
         store.put(&k, &entry)?;
     }
 
     std::io::stdout().write_all(&output.stdout)?;
     Ok(code)
+}
+
+/// Read 経路で gh の出力からキャッシュ用 Entry を組み立てる。
+/// 同じ形を refresh worker でも使うので 1 か所に寄せておく。
+fn build_entry(argv: &[String], kind: &str, body: Vec<u8>, fetched_at: u64, ttl_secs: u64) -> Entry {
+    Entry {
+        argv_json: serde_json::to_string(argv).unwrap_or_default(),
+        kind: kind.to_string(),
+        repo: key::detect_repo(argv),
+        body,
+        fetched_at,
+        ttl_secs,
+    }
 }
 
 /// Write 経路。gh を透過で実行し、成功時のみ invalidate。
@@ -193,14 +199,7 @@ pub fn refresh_into_cache(
     }
 
     let store = Store::open_default()?;
-    let entry = Entry {
-        argv_json: serde_json::to_string(argv).unwrap_or_default(),
-        kind: kind.to_string(),
-        repo: key::detect_repo(argv),
-        body: output.stdout,
-        fetched_at: epoch_secs(),
-        ttl_secs,
-    };
+    let entry = build_entry(argv, kind, output.stdout, epoch_secs(), ttl_secs);
     store.put(cache_key, &entry)?;
     Ok(())
 }
@@ -210,20 +209,7 @@ pub fn refresh_into_cache(
 ///   2) IPC が失敗したら自分のコピーを `--refresh` で detached spawn
 ///   3) ついでに daemon を auto-spawn して次回以降に備える
 fn kick_background_refresh(argv: &[String], kind: &str, ttl: u64, cache_key: &str) {
-    let msg = Message::Refresh {
-        argv: argv.to_vec(),
-        cache_kind: kind.to_string(),
-        ttl_secs: ttl,
-        cache_key: cache_key.to_string(),
-    };
-
-    if ipc::try_send(&msg) {
-        return;
-    }
-
-    // IPC fail → daemon を裏で立ち上げて、今回は subprocess で代行する
-    daemon::ensure_running();
-    spawn_refresh_subprocess(argv).ok();
+    dispatch_refresh(argv, kind, ttl, cache_key);
 }
 
 /// Write 成功後の write-through 再取得を daemon にお願いする。
@@ -234,18 +220,24 @@ fn kick_write_through_refresh(target: &RefreshTarget) {
         Ok(v) => v,
         Err(_) => return, // 壊れた argv_json は捨てる。stale が残るより mass 化したくないので無視
     };
+    dispatch_refresh(&argv, &target.kind, target.ttl_secs, &target.cache_key);
+}
+
+/// Refresh メッセージを daemon に投げる共通経路。
+/// IPC 成功で即終了、失敗時は daemon を立ち上げつつ自分の copy を detached subprocess
+/// として `--refresh` で代行起動する。
+fn dispatch_refresh(argv: &[String], kind: &str, ttl: u64, cache_key: &str) {
     let msg = Message::Refresh {
-        argv: argv.clone(),
-        cache_kind: target.kind.clone(),
-        ttl_secs: target.ttl_secs,
-        cache_key: target.cache_key.clone(),
+        argv: argv.to_vec(),
+        cache_kind: kind.to_string(),
+        ttl_secs: ttl,
+        cache_key: cache_key.to_string(),
     };
     if ipc::try_send(&msg) {
         return;
     }
-    // daemon が居なければ立てて、今回分は自分の copy を detached で代行
     daemon::ensure_running();
-    spawn_refresh_subprocess(&argv).ok();
+    spawn_refresh_subprocess(argv).ok();
 }
 
 /// daemon 内部用の write-through 再取得。IPC を経由せず別スレッドで直接 gh を回す。
