@@ -11,7 +11,7 @@ use std::io::Write;
 use crate::store::Store;
 
 pub fn handle(args: &[String]) -> Result<i32> {
-    match args.first().map(|s| s.as_str()) {
+    match args.first().map(String::as_str) {
         None => list(20),
         Some("list") => {
             let limit = args
