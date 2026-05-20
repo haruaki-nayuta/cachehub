@@ -8,9 +8,9 @@ use anyhow::Result;
 use crate::store::Store;
 
 pub fn handle(args: &[String]) -> Result<i32> {
-    match args.first().map(|s| s.as_str()) {
+    match args.first().map(String::as_str) {
         Some("stats") => stats(),
-        Some("purge") => purge(args.get(1).map(|s| s.as_str())),
+        Some("purge") => purge(args.get(1).map(String::as_str)),
         Some(other) => {
             eprintln!("ch: 未知のサブコマンド: cache {other}");
             eprintln!("使い方: ch cache <stats|purge> [pattern]");
