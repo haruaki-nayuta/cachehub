@@ -1,6 +1,6 @@
 [package]
 name = "ch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "gh の Read だけをキャッシュして高速化する小さな CLI"
 

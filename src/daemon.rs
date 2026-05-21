@@ -1,13 +1,15 @@
 // chd: 常駐デーモン本体。
 //
 // 同一バイナリで `ch --daemon` として起動される（busybox 方式）。
-// 役割（v0.2 時点）:
+// 役割（v0.3 時点）:
 //   - Unix domain socket を listen し、JSON Lines の Message を受け取る
-//   - Refresh メッセージ: gh を別スレッドで実行して cache を上書き（SWR の裏更新）
-//   - Stop メッセージ: socket file を削除して exit
+//   - Refresh: gh を別スレッドで実行して cache を上書き（SWR の裏更新）
+//   - AsyncExec: async_passthrough 時の fire-and-forget な gh 実行
+//   - PrefetchIssues: issue list を起点に各 issue view を裏で先読み（prefetch.rs）
+//   - Stop: socket file を削除して exit
 //   - Ping: 何もしない（liveness 用）
 //
-// v0.3 以降の Events ポーリング・連想プリフェッチを足す土台でもある。
+// Events ポーリング（active_repos を定期巡回する自発プリフェッチ）は将来の課題。
 
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
@@ -23,6 +25,7 @@ use std::os::unix::process::CommandExt;
 
 use crate::exec;
 use crate::ipc::{is_alive, socket_path, Message};
+use crate::prefetch;
 
 /// daemon 本体。`--daemon` で呼ばれる長寿命プロセス。
 pub fn run() -> Result<()> {
@@ -126,6 +129,14 @@ fn process(msg: Message, stop_flag: &Arc<AtomicBool>) {
             thread::spawn(move || {
                 if let Err(e) = exec::run_async_exec(&argv) {
                     eprintln!("chd: async exec 失敗: {e:#}");
+                }
+            });
+        }
+        Message::PrefetchIssues { list_argv, cwd } => {
+            // issue list を起点に各 issue view を裏で温める
+            thread::spawn(move || {
+                if let Err(e) = prefetch::run(&list_argv, &cwd) {
+                    eprintln!("chd: prefetch 失敗: {e:#}");
                 }
             });
         }

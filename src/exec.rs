@@ -38,7 +38,13 @@ pub fn passthrough(argv: &[String]) -> Result<i32> {
 ///   fresh hit  → body を即返す
 ///   stale hit  → body を即返してから refresh を裏で kick（IPC → fallback で detached subprocess）
 ///   miss       → gh を同期実行して保存
-pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64) -> Result<i32> {
+pub fn handle_read(
+    store: &Store,
+    argv: &[String],
+    kind: &'static str,
+    ttl: u64,
+    cfg: &Config,
+) -> Result<i32> {
     let k = key::cache_key(argv);
     let now = epoch_secs();
 
@@ -51,6 +57,7 @@ pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64)
             // fresh hit
             std::io::stdout().write_all(&entry.body)?;
             store.bump_hit(&k)?;
+            maybe_kick_issue_prefetch(argv, kind, cfg);
             return Ok(0);
         }
 
@@ -58,6 +65,7 @@ pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64)
         std::io::stdout().write_all(&entry.body)?;
         store.bump_hit(&k)?;
         kick_background_refresh(argv, kind, ttl, &k);
+        maybe_kick_issue_prefetch(argv, kind, cfg);
         return Ok(0);
     }
 
@@ -76,6 +84,7 @@ pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64)
     if code == 0 {
         let entry = build_entry(argv, kind, output.stdout.clone(), now, ttl);
         store.put(&k, &entry)?;
+        maybe_kick_issue_prefetch(argv, kind, cfg);
     }
 
     std::io::stdout().write_all(&output.stdout)?;
@@ -84,7 +93,13 @@ pub fn handle_read(store: &Store, argv: &[String], kind: &'static str, ttl: u64)
 
 /// Read 経路で gh の出力からキャッシュ用 Entry を組み立てる。
 /// 同じ形を refresh worker でも使うので 1 か所に寄せておく。
-fn build_entry(argv: &[String], kind: &str, body: Vec<u8>, fetched_at: u64, ttl_secs: u64) -> Entry {
+pub(crate) fn build_entry(
+    argv: &[String],
+    kind: &str,
+    body: Vec<u8>,
+    fetched_at: u64,
+    ttl_secs: u64,
+) -> Entry {
     Entry {
         argv_json: serde_json::to_string(argv).unwrap_or_default(),
         kind: kind.to_string(),
@@ -210,6 +225,29 @@ pub fn refresh_into_cache(
 ///   3) ついでに daemon を auto-spawn して次回以降に備える
 fn kick_background_refresh(argv: &[String], kind: &str, ttl: u64, cache_key: &str) {
     dispatch_refresh(argv, kind, ttl, cache_key);
+}
+
+/// issue list の Read が成功したら、列挙された各 issue view を `chd` に先読みさせる。
+///
+/// opt-in（`config.prefetch`）。`chd` が居なければ今回は諦めて auto-spawn だけしておく。
+/// SWR の refresh と違い stale 救済の必要が無いので subprocess fallback は持たない
+/// （取りこぼしても次の `ch` 起動から効けばよい）。
+fn maybe_kick_issue_prefetch(argv: &[String], kind: &str, cfg: &Config) {
+    if !cfg.prefetch || kind != "issue_list" {
+        return;
+    }
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let msg = Message::PrefetchIssues {
+        list_argv: argv.to_vec(),
+        cwd,
+    };
+    if ipc::try_send(&msg) {
+        return;
+    }
+    daemon::ensure_running();
 }
 
 /// Write 成功後の write-through 再取得を daemon にお願いする。
