@@ -27,6 +27,11 @@ pub enum Message {
     /// chd が gh を実行し、失敗時のみ exec_errors に記録する。
     /// Write 系で成功した場合は cache invalidate もデーモン側で走らせる。
     AsyncExec { argv: Vec<String> },
+    /// issue list を起点にした連想プリフェッチ依頼。
+    /// chd が issue 番号を取り直し、各 `gh issue view` を裏で温める。
+    /// `cwd` はユーザが `ch` を叩いた作業ディレクトリ。gh のリポジトリ解決と
+    /// cache key の両方で「ユーザ視点の cwd」を再現するために必要。
+    PrefetchIssues { list_argv: Vec<String>, cwd: String },
     /// 生存確認。daemon は何もしないで読み捨てる。
     Ping,
     /// `ch daemon stop` から送られる。daemon は素直に exit する。
@@ -85,6 +90,10 @@ mod tests {
             },
             Message::AsyncExec {
                 argv: vec!["issue".into(), "close".into(), "1".into()],
+            },
+            Message::PrefetchIssues {
+                list_argv: vec!["issue".into(), "list".into()],
+                cwd: "/tmp/repo".into(),
             },
             Message::Ping,
             Message::Stop,

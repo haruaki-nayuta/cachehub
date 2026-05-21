@@ -19,6 +19,7 @@ mod exec;
 mod invalidate;
 mod ipc;
 mod key;
+mod prefetch;
 mod router;
 mod store;
 
@@ -75,7 +76,7 @@ fn run() -> Result<i32> {
     daemon::ensure_running();
 
     match router::classify(&args) {
-        router::Action::Read { kind, ttl } => exec::handle_read(&store, &args, kind, ttl),
+        router::Action::Read { kind, ttl } => exec::handle_read(&store, &args, kind, ttl, &cfg),
         router::Action::Write => exec::handle_write(&store, &args, &cfg),
         router::Action::Passthrough => exec::handle_passthrough(&args, &cfg),
     }

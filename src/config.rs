@@ -2,7 +2,7 @@
 //
 // 探索順 (後勝ち):
 //   1. ファイル: `$CH_CONFIG_PATH` か `~/.config/ch/config`
-//   2. 環境変数: `CH_ASYNC_PASSTHROUGH`
+//   2. 環境変数: `CH_ASYNC_PASSTHROUGH` / `CH_PREFETCH`
 //
 // 余計な依存を増やしたくないので TOML/INI パーサは使わず、自前の薄い行パーサで済ませる。
 
@@ -14,6 +14,9 @@ pub struct Config {
     /// true なら Write / Passthrough 系の gh 呼び出しを daemon に投げて即 0 を返す。
     /// LLM から fire-and-forget で使うときに便利。失敗は exec_errors に記録される。
     pub async_passthrough: bool,
+    /// true なら `ch issue list` のあと、列挙された各 issue view を daemon が
+    /// 裏で先読みする（連想プリフェッチ）。詳細は prefetch.rs。
+    pub prefetch: bool,
 }
 
 impl Config {
@@ -28,6 +31,9 @@ impl Config {
 
         if let Ok(v) = std::env::var("CH_ASYNC_PASSTHROUGH") {
             cfg.async_passthrough = parse_bool(&v);
+        }
+        if let Ok(v) = std::env::var("CH_PREFETCH") {
+            cfg.prefetch = parse_bool(&v);
         }
 
         cfg
@@ -44,8 +50,10 @@ fn apply_kv(cfg: &mut Config, content: &str) {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        if k.trim() == "async_passthrough" {
-            cfg.async_passthrough = parse_bool(v.trim());
+        match k.trim() {
+            "async_passthrough" => cfg.async_passthrough = parse_bool(v.trim()),
+            "prefetch" => cfg.prefetch = parse_bool(v.trim()),
+            _ => {}
         }
     }
 }
@@ -82,6 +90,20 @@ mod tests {
         let mut cfg = Config::default();
         apply_kv(&mut cfg, "# 全行コメント\nasync_passthrough = 0\n");
         assert!(!cfg.async_passthrough);
+    }
+
+    #[test]
+    fn prefetch_key_parsed() {
+        let mut cfg = Config::default();
+        apply_kv(&mut cfg, "prefetch = true");
+        assert!(cfg.prefetch);
+        assert!(!cfg.async_passthrough);
+
+        // 2 キー併用しても互いに干渉しない
+        let mut cfg = Config::default();
+        apply_kv(&mut cfg, "prefetch=on\nasync_passthrough=yes");
+        assert!(cfg.prefetch);
+        assert!(cfg.async_passthrough);
     }
 
     #[test]

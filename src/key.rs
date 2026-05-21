@@ -10,7 +10,13 @@ pub fn cache_key(argv: &[String]) -> String {
         .ok()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    cache_key_with_cwd(&cwd, argv)
+}
 
+/// `cache_key` の cwd を明示指定する版。
+/// daemon は自分の cwd と無関係に「ユーザが ch を叩いた cwd」でキーを組む必要がある
+/// （連想プリフェッチで、後続の `ch issue view` と同じキーに当てるため）。
+pub fn cache_key_with_cwd(cwd: &str, argv: &[String]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(cwd.as_bytes());
     hasher.update(b"\x1f");
@@ -73,6 +79,21 @@ mod tests {
         let a = cache_key(&argv(&["issue", "view", "1"]));
         let b = cache_key(&argv(&["issue", "view", "2"]));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cache_key_with_cwd_is_cwd_sensitive() {
+        let av = argv(&["issue", "view", "1"]);
+        // 同じ cwd + 同じ argv なら一致
+        assert_eq!(
+            cache_key_with_cwd("/tmp/x", &av),
+            cache_key_with_cwd("/tmp/x", &av)
+        );
+        // cwd が違えばキーも違う（daemon が誤った cwd で当てないことの担保）
+        assert_ne!(
+            cache_key_with_cwd("/tmp/x", &av),
+            cache_key_with_cwd("/tmp/y", &av)
+        );
     }
 
     // argv の「区切り位置」が違えば別キーになること。セパレータが効いていないと
