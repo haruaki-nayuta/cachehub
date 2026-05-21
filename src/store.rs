@@ -488,6 +488,85 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
+    // stats() の集計と、put 上書きで hit_count が保たれること。
+    // SWR 裏更新は cache を put し直すため、hit_count がリセットされると
+    // `ch cache stats` のヒット数が嘘になる。
+    // 参考: moka はヒット/ミス統計の正確性を検証する。
+    #[test]
+    fn stats_aggregates_and_overwrite_preserves_hit_count() {
+        let s = make_store();
+        assert_eq!(s.stats().unwrap().total, 0, "空 DB は total=0");
+        assert_eq!(s.stats().unwrap().hit_sum, 0, "空 DB は hit_sum=0 (COALESCE)");
+
+        s.put("k1", &entry("issue_view", Some("a/b"), b"hello"))
+            .unwrap();
+        s.put("k2", &entry("pr_view", Some("a/b"), b"xy")).unwrap();
+        s.bump_hit("k1").unwrap();
+        s.bump_hit("k1").unwrap();
+        s.bump_hit("k2").unwrap();
+
+        // 裏更新を模して k1 を上書き
+        s.put("k1", &entry("issue_view", Some("a/b"), b"hello2"))
+            .unwrap();
+
+        let st = s.stats().unwrap();
+        assert_eq!(st.total, 2);
+        assert_eq!(st.hit_sum, 3, "put 上書き後も hit_count は保持される");
+        assert_eq!(st.size_bytes, "hello2".len() as i64 + 2);
+        // by_kind は kind 昇順
+        assert_eq!(st.by_kind.len(), 2);
+        assert_eq!(st.by_kind[0].kind, "issue_view");
+        assert_eq!(st.by_kind[0].hits, 2);
+        assert_eq!(st.by_kind[1].kind, "pr_view");
+    }
+
+    // purge: pattern なしで全削除、ありなら kind/repo に LIKE マッチ。
+    #[test]
+    fn purge_all_and_by_pattern() {
+        let s = make_store();
+        s.put("k1", &entry("issue_view", Some("a/b"), b"x")).unwrap();
+        s.put("k2", &entry("pr_view", Some("a/b"), b"y")).unwrap();
+        s.put("k3", &entry("repo_view", Some("c/d"), b"z")).unwrap();
+
+        // kind LIKE 'issue%' → k1 のみ
+        let n = s.purge(Some("issue%")).unwrap();
+        assert_eq!(n, 1);
+        assert!(s.get("k1").unwrap().is_none());
+        assert!(s.get("k2").unwrap().is_some());
+
+        // repo LIKE 'c/%' → k3 がヒット（pattern は repo にも当たる）
+        let n = s.purge(Some("c/%")).unwrap();
+        assert_eq!(n, 1);
+        assert!(s.get("k3").unwrap().is_none());
+
+        // pattern なし → 残り全部
+        s.put("k4", &entry("pr_view", None, b"w")).unwrap();
+        let n = s.purge(None).unwrap();
+        assert_eq!(n, 2, "k2 と k4");
+        assert_eq!(s.stats().unwrap().total, 0);
+    }
+
+    // mark_active は repo ごとに last_used を upsert し、
+    // active_repos は within_secs の閾値より新しいものだけを新しい順で返す。
+    #[test]
+    fn mark_active_upserts_and_active_repos_filters_by_threshold() {
+        let s = make_store();
+        s.mark_active("a/b", 100).unwrap();
+        s.mark_active("a/b", 200).unwrap(); // 同 repo は upsert で last_used 更新
+        s.mark_active("old/repo", 100).unwrap();
+
+        // now=210, within=50 → threshold=160。a/b(200) は残り old/repo(100) は落ちる
+        let active = s.active_repos(50, 210).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0], ("a/b".to_string(), 200));
+
+        // within を広げれば両方拾い、last_used 降順で並ぶ
+        let all = s.active_repos(1000, 210).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, "a/b");
+        assert_eq!(all[1].0, "old/repo");
+    }
+
     #[test]
     fn drop_by_kind_without_repo_wipes_kind() {
         let s = make_store();

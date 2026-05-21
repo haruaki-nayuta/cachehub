@@ -128,6 +128,39 @@ mod tests {
         assert!(matches!(classify(&argv(&["repo", "edit"])), Action::Write));
     }
 
+    // 破壊的 verb が 1 つでも Write から漏れると invalidate されず stale が残る。
+    // 参考: cobra は全サブコマンドの分類を表形式で網羅検証する。
+    #[test]
+    fn dangerous_write_verbs_never_leak_to_passthrough() {
+        let dangerous = [
+            &["issue", "delete", "1"][..],
+            &["issue", "transfer", "1"][..],
+            &["issue", "edit", "1"][..],
+            &["pr", "review", "1"][..],
+            &["pr", "ready", "1"][..],
+            &["pr", "update-branch", "1"][..],
+            &["repo", "delete", "a/b"][..],
+            &["repo", "rename", "new"][..],
+            &["repo", "archive", "a/b"][..],
+        ];
+        for cmd in dangerous {
+            assert!(
+                matches!(classify(&argv(cmd)), Action::Write),
+                "{cmd:?} は Write に分類されるべき（漏れると invalidate されない）"
+            );
+        }
+    }
+
+    // 空 argv / サブコマンド名詞だけの入力でパニックせず Passthrough に倒れること。
+    // 参考: cobra は引数欠落時のディスパッチを境界値として検証する。
+    #[test]
+    fn empty_and_bare_subcommand_passthrough() {
+        assert!(matches!(classify(&argv(&[])), Action::Passthrough));
+        assert!(matches!(classify(&argv(&["issue"])), Action::Passthrough));
+        assert!(matches!(classify(&argv(&["pr"])), Action::Passthrough));
+        assert!(matches!(classify(&argv(&["repo"])), Action::Passthrough));
+    }
+
     #[test]
     fn unknown_subcommands_passthrough() {
         // gist は whitelist にない → 安全側に倒して素通し

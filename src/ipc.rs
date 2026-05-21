@@ -66,3 +66,67 @@ pub fn try_send(msg: &Message) -> bool {
 pub fn is_alive() -> bool {
     try_send(&Message::Ping)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ch と chd は別バイナリ起動なので Message の wire 形式が両者で一致している必要がある。
+    // daemon 側は serde_json::from_str で 1 行ずつ受けるため、round-trip が壊れると
+    // 全メッセージが parse error で黙って捨てられる。
+    #[test]
+    fn message_json_roundtrip_all_variants() {
+        let cases = vec![
+            Message::Refresh {
+                argv: vec!["issue".into(), "view".into(), "1".into()],
+                cache_kind: "issue_view".into(),
+                ttl_secs: 60,
+                cache_key: "abc123".into(),
+            },
+            Message::AsyncExec {
+                argv: vec!["issue".into(), "close".into(), "1".into()],
+            },
+            Message::Ping,
+            Message::Stop,
+        ];
+        for msg in cases {
+            let line = serde_json::to_string(&msg).expect("serialize");
+            // tag=kind なので必ず "kind" フィールドを持つ
+            assert!(line.contains("\"kind\""), "tag が欠落: {line}");
+            // 改行を含まない（JSON Lines プロトコルの前提）
+            assert!(!line.contains('\n'), "1 メッセージ 1 行のはず: {line}");
+            // deserialize → 再 serialize で安定（往復で形が変わらない）
+            let back: Message = serde_json::from_str(&line).expect("deserialize");
+            assert_eq!(serde_json::to_string(&back).unwrap(), line);
+        }
+    }
+
+    // Refresh は tag 名 "kind" と中身の "cache_kind" が別物として共存できること。
+    #[test]
+    fn refresh_tag_and_cache_kind_coexist() {
+        let line = serde_json::to_string(&Message::Refresh {
+            argv: vec![],
+            cache_kind: "pr_list".into(),
+            ttl_secs: 30,
+            cache_key: "k".into(),
+        })
+        .unwrap();
+        let back: Message = serde_json::from_str(&line).unwrap();
+        match back {
+            Message::Refresh {
+                cache_kind, ttl_secs, ..
+            } => {
+                assert_eq!(cache_kind, "pr_list");
+                assert_eq!(ttl_secs, 30);
+            }
+            _ => panic!("Refresh として復元されるべき"),
+        }
+    }
+
+    // 壊れた行は from_str が Err を返す（daemon が握り潰せる前提）。
+    #[test]
+    fn malformed_line_is_rejected() {
+        assert!(serde_json::from_str::<Message>("{not json}").is_err());
+        assert!(serde_json::from_str::<Message>("{\"kind\":\"Unknown\"}").is_err());
+    }
+}

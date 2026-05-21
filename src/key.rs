@@ -74,4 +74,40 @@ mod tests {
         let b = cache_key(&argv(&["issue", "view", "2"]));
         assert_ne!(a, b);
     }
+
+    // argv の「区切り位置」が違えば別キーになること。セパレータが効いていないと
+    // ["issue","view1"] と ["issue","view","1"] が衝突し別レスポンスを取り違える。
+    // 参考: sccache はキャッシュキー衝突を厳密に検証する。
+    #[test]
+    fn argv_boundary_does_not_collide() {
+        assert_ne!(
+            cache_key(&argv(&["issue", "view", "1"])),
+            cache_key(&argv(&["issue", "view1"])),
+        );
+        assert_ne!(
+            cache_key(&argv(&["ab", "c"])),
+            cache_key(&argv(&["a", "bc"])),
+        );
+        // 結合して 1 引数にしたものとも衝突しない
+        assert_ne!(
+            cache_key(&argv(&["issue", "list"])),
+            cache_key(&argv(&["issuelist"])),
+        );
+    }
+
+    // 空 argv（ch を引数なしで叩いた相当）でもパニックせず安定したキーを返すこと。
+    #[test]
+    fn empty_argv_key_is_stable() {
+        let a = cache_key(&argv(&[]));
+        let b = cache_key(&argv(&[]));
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+    }
+
+    // `--repo` が値を伴わず末尾に来てもパニックせず None を返すこと（境界値）。
+    #[test]
+    fn detect_repo_trailing_flag_without_value() {
+        assert_eq!(detect_repo(&argv(&["issue", "view", "--repo"])), None);
+        assert_eq!(detect_repo(&argv(&["issue", "view", "-R"])), None);
+    }
 }
