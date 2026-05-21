@@ -33,6 +33,26 @@ pub fn passthrough(argv: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+/// キャッシュ hit 時の鮮度。`store.get` が None の miss はここに含めない。
+#[derive(Debug, PartialEq, Eq)]
+enum Freshness {
+    /// TTL 内。そのまま即返してよい
+    Fresh,
+    /// TTL 切れ。古い body を返しつつ裏で refresh を kick する（SWR）
+    Stale,
+}
+
+/// fetched_at からの経過秒と TTL を比べて鮮度を決める純粋関数。
+/// `now < fetched_at`（時計の巻き戻り）でも saturating_sub で age=0 に飽和し Fresh に倒れる。
+fn freshness(now: u64, fetched_at: u64, ttl_secs: u64) -> Freshness {
+    let age = now.saturating_sub(fetched_at);
+    if age < ttl_secs {
+        Freshness::Fresh
+    } else {
+        Freshness::Stale
+    }
+}
+
 /// Read 経路（SWR 対応）。
 ///
 ///   fresh hit  → body を即返す
@@ -52,19 +72,12 @@ pub fn handle_read(
     mark_active(store, argv, now).ok();
 
     if let Some(entry) = store.get(&k)? {
-        let age = now.saturating_sub(entry.fetched_at);
-        if age < entry.ttl_secs {
-            // fresh hit
-            std::io::stdout().write_all(&entry.body)?;
-            store.bump_hit(&k)?;
-            maybe_kick_issue_prefetch(argv, kind, cfg);
-            return Ok(0);
-        }
-
-        // stale: 先に古いやつを返して、裏で更新を走らせる
+        // fresh / stale とも古い body を即返す（SWR）。違いは裏更新を kick するか否か
         std::io::stdout().write_all(&entry.body)?;
         store.bump_hit(&k)?;
-        kick_background_refresh(argv, kind, ttl, &k);
+        if freshness(now, entry.fetched_at, entry.ttl_secs) == Freshness::Stale {
+            kick_background_refresh(argv, kind, ttl, &k);
+        }
         maybe_kick_issue_prefetch(argv, kind, cfg);
         return Ok(0);
     }
@@ -326,4 +339,33 @@ pub fn epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TTL ちょうどの瞬間は stale 側に倒れる（fresh 判定は age < ttl の厳密未満）。
+    // 参考: moka は expiration の境界を「ちょうど」「直前」「直後」で検証する。
+    #[test]
+    fn freshness_boundary_around_exact_ttl() {
+        // fetched_at=100, ttl=60 → age=59 は Fresh、age=60 は Stale、age=61 は Stale
+        assert_eq!(freshness(159, 100, 60), Freshness::Fresh);
+        assert_eq!(freshness(160, 100, 60), Freshness::Stale);
+        assert_eq!(freshness(161, 100, 60), Freshness::Stale);
+    }
+
+    // ttl=0 のエントリは保存直後でも常に stale（hit しても毎回 refresh が走る）。
+    #[test]
+    fn freshness_zero_ttl_is_always_stale() {
+        assert_eq!(freshness(100, 100, 0), Freshness::Stale);
+        assert_eq!(freshness(1000, 100, 0), Freshness::Stale);
+    }
+
+    // 時計が巻き戻って fetched_at > now になっても、saturating_sub で age=0 = Fresh。
+    // u64 アンダーフローでパニックしないことの確認。
+    #[test]
+    fn freshness_clock_skew_does_not_underflow() {
+        assert_eq!(freshness(50, 100, 60), Freshness::Fresh);
+    }
 }
