@@ -129,6 +129,45 @@ mod tests {
         assert!(s.get("p2").unwrap().is_some());
     }
 
+    // --repo を読めない Write は kind 全体を drop する（コメント明記の保守的 invalidate）。
+    // ここが壊れると別 repo の stale が残り続ける。
+    #[test]
+    fn write_without_repo_drops_whole_kind() {
+        let s = open_tmp_store();
+        s.put("ka", &entry("issue_view", Some("a/b"), "[\"issue\",\"view\",\"1\"]"))
+            .unwrap();
+        s.put("kc", &entry("issue_view", Some("c/d"), "[\"issue\",\"view\",\"2\"]"))
+            .unwrap();
+        s.put("kn", &entry("issue_list", None, "[\"issue\",\"list\"]"))
+            .unwrap();
+
+        // --repo なし → issue_view / issue_list を repo 問わず全部 drop
+        let targets = run(&s, &argv(&["issue", "close", "1"])).unwrap();
+
+        assert_eq!(targets.len(), 3, "repo を跨いで view 2 件 + list 1 件");
+        assert!(s.get("ka").unwrap().is_none());
+        assert!(s.get("kc").unwrap().is_none());
+        assert!(s.get("kn").unwrap().is_none());
+    }
+
+    // repo 名詞の Write は repo_view を drop し再取得対象に含めること。
+    #[test]
+    fn repo_write_drops_repo_view() {
+        let s = open_tmp_store();
+        s.put("r1", &entry("repo_view", Some("a/b"), "[\"repo\",\"view\",\"a/b\"]"))
+            .unwrap();
+        // issue 系は repo Write の対象外
+        s.put("i1", &entry("issue_view", Some("a/b"), "[\"issue\",\"view\",\"1\"]"))
+            .unwrap();
+
+        let targets = run(&s, &argv(&["repo", "edit", "--repo", "a/b"])).unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].kind, "repo_view");
+        assert!(s.get("r1").unwrap().is_none());
+        assert!(s.get("i1").unwrap().is_some());
+    }
+
     #[test]
     fn unknown_write_returns_empty_and_changes_nothing() {
         let s = open_tmp_store();
