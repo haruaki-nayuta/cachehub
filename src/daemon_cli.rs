@@ -35,11 +35,45 @@ fn status() -> Result<i32> {
     println!("状態   : {}", if alive { "起動中" } else { "停止中" });
 
     let store = Store::open_default()?;
+    let now = exec::epoch_secs();
+
+    // GlobalLimiter のスナップショット（chd プロセス内のメモリ → SQLite に書き出された値を読む）
+    if let Some(s) = store.get_ratelimit_state()? {
+        println!();
+        println!("--- rate limit ---");
+        println!(
+            "バケット    : {:.1} / {} (補充 {:.2}/sec)",
+            s.bucket_tokens, s.bucket_capacity, s.refill_per_sec
+        );
+        println!(
+            "Limiter 状態: {}",
+            if s.paused { "一時停止 (headroom低)" } else { "稼働" }
+        );
+        match (s.remaining, s.remaining_at) {
+            (Some(r), Some(at)) => {
+                let age = now.saturating_sub(at);
+                println!("GitHub 残量 : {r} ({age}s 前にサンプリング)");
+            }
+            _ => println!("GitHub 残量 : (未サンプリング)"),
+        }
+        println!(
+            "累計        : enqueued={} consumed={} skipped={}",
+            s.enqueued_total, s.consumed_total, s.skipped_total
+        );
+        let age = now.saturating_sub(s.updated_at);
+        println!("最終更新    : {age}s 前");
+    } else {
+        println!();
+        println!("--- rate limit ---");
+        println!("(まだスナップショットが書かれていません。chd 起動直後か warmer_enabled=false の可能性)");
+    }
+
     // §6.B のしきい値：直近 72h
-    let active = store.active_repos(72 * 3600, exec::epoch_secs())?;
+    println!();
+    let active = store.active_repos(72 * 3600, now)?;
     println!("アクティブリポジトリ ({} 件, 直近72h):", active.len());
     for (repo, last_used) in active.iter().take(20) {
-        let age_secs = exec::epoch_secs().saturating_sub(*last_used);
+        let age_secs = now.saturating_sub(*last_used);
         println!("  {repo:<60}  ({age_secs}s 前)");
     }
     if active.len() > 20 {

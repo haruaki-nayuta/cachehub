@@ -18,14 +18,17 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use std::os::unix::process::CommandExt;
 
+use crate::config::Config;
 use crate::exec;
 use crate::ipc::{is_alive, socket_path, Message};
+use crate::limiter;
 use crate::prefetch;
+use crate::warmer::{self, WarmerConfig};
 
 /// daemon 本体。`--daemon` で呼ばれる長寿命プロセス。
 pub fn run() -> Result<()> {
@@ -39,7 +42,12 @@ pub fn run() -> Result<()> {
 
     eprintln!("chd: 起動 (socket={})", sock.display());
 
+    let cfg = Config::load();
     let stop_flag = Arc::new(AtomicBool::new(false));
+
+    // GlobalLimiter は chd プロセスに 1 つだけ。Warmer / prefetch が同じバケットを共有する。
+    let global = limiter::init_global(cfg.ratelimit_per_min);
+    let workers = spawn_background_workers(&cfg, global, stop_flag.clone());
 
     // accept ループ。Stop が来たら non-blocking で抜ける
     for stream in listener.incoming() {
@@ -61,10 +69,36 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // 背景ワーカーの停止を待つ（stop_flag を見て自発的に抜ける設計）
+    for h in workers {
+        let _ = h.join();
+    }
+
     // 後片付け
     let _ = std::fs::remove_file(&sock);
     eprintln!("chd: 終了");
     Ok(())
+}
+
+fn spawn_background_workers(
+    cfg: &Config,
+    limiter: Arc<limiter::GlobalLimiter>,
+    stop_flag: Arc<AtomicBool>,
+) -> Vec<JoinHandle<()>> {
+    if !cfg.warmer_enabled {
+        return Vec::new();
+    }
+    vec![
+        warmer::spawn_warmer(
+            limiter.clone(),
+            WarmerConfig {
+                interval: Duration::from_secs(cfg.warmer_interval_secs.max(1)),
+                batch_limit: cfg.warmer_batch,
+            },
+            stop_flag.clone(),
+        ),
+        warmer::spawn_headroom_sampler(limiter, cfg.ratelimit_headroom, stop_flag),
+    ]
 }
 
 /// bind に失敗したら：

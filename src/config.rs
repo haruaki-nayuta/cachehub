@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// true なら Write / Passthrough 系の gh 呼び出しを daemon に投げて即 0 を返す。
     /// LLM から fire-and-forget で使うときに便利。失敗は exec_errors に記録される。
@@ -17,6 +17,31 @@ pub struct Config {
     /// true なら `ch issue list` のあと、列挙された各 issue view を daemon が
     /// 裏で先読みする（連想プリフェッチ）。詳細は prefetch.rs。
     pub prefetch: bool,
+    /// グローバルレートリミッタの容量 = 1 分あたりの最大プリフェッチ件数（spec §9 [ratelimit]）。
+    /// Warmer / prefetch の両方を覆う。0 にすると裏更新は全部止まる（ユーザ操作は影響なし）。
+    pub ratelimit_per_min: u32,
+    /// `X-RateLimit-Remaining` がこれを切ったら Warmer / prefetch を一時停止する（spec §10）。
+    pub ratelimit_headroom: u32,
+    /// false なら Warmer / headroom sampler スレッドを起動しない。
+    pub warmer_enabled: bool,
+    /// Warmer ティックの間隔（秒）。
+    pub warmer_interval_secs: u64,
+    /// 1 ティックで refresh を試みる stale エントリの最大件数。
+    pub warmer_batch: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            async_passthrough: false,
+            prefetch: false,
+            ratelimit_per_min: 120,
+            ratelimit_headroom: 500,
+            warmer_enabled: true,
+            warmer_interval_secs: 30,
+            warmer_batch: 20,
+        }
+    }
 }
 
 impl Config {
@@ -50,9 +75,32 @@ fn apply_kv(cfg: &mut Config, content: &str) {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        match k.trim() {
-            "async_passthrough" => cfg.async_passthrough = parse_bool(v.trim()),
-            "prefetch" => cfg.prefetch = parse_bool(v.trim()),
+        let k = k.trim();
+        let v = v.trim();
+        match k {
+            "async_passthrough" => cfg.async_passthrough = parse_bool(v),
+            "prefetch" => cfg.prefetch = parse_bool(v),
+            "ratelimit_per_min" => {
+                if let Ok(n) = v.parse() {
+                    cfg.ratelimit_per_min = n;
+                }
+            }
+            "ratelimit_headroom" => {
+                if let Ok(n) = v.parse() {
+                    cfg.ratelimit_headroom = n;
+                }
+            }
+            "warmer_enabled" => cfg.warmer_enabled = parse_bool(v),
+            "warmer_interval_secs" => {
+                if let Ok(n) = v.parse() {
+                    cfg.warmer_interval_secs = n;
+                }
+            }
+            "warmer_batch" => {
+                if let Ok(n) = v.parse() {
+                    cfg.warmer_batch = n;
+                }
+            }
             _ => {}
         }
     }
@@ -111,5 +159,27 @@ mod tests {
         let mut cfg = Config::default();
         apply_kv(&mut cfg, "future_setting=yes\nasync_passthrough=true");
         assert!(cfg.async_passthrough);
+    }
+
+    #[test]
+    fn ratelimit_and_warmer_keys_parsed() {
+        let mut cfg = Config::default();
+        apply_kv(
+            &mut cfg,
+            "ratelimit_per_min = 60\nratelimit_headroom = 200\nwarmer_enabled = false\nwarmer_interval_secs = 10\nwarmer_batch = 5",
+        );
+        assert_eq!(cfg.ratelimit_per_min, 60);
+        assert_eq!(cfg.ratelimit_headroom, 200);
+        assert!(!cfg.warmer_enabled);
+        assert_eq!(cfg.warmer_interval_secs, 10);
+        assert_eq!(cfg.warmer_batch, 5);
+    }
+
+    #[test]
+    fn defaults_match_spec() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ratelimit_per_min, 120);
+        assert_eq!(cfg.ratelimit_headroom, 500);
+        assert!(cfg.warmer_enabled);
     }
 }
