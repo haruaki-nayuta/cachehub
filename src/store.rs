@@ -42,6 +42,32 @@ pub struct RefreshTarget {
     pub ttl_secs: u64,
 }
 
+/// Warmer が「TTL 切れだから再取得したい」と判定した cache 行の最小情報。
+/// `list_refresh_targets` の RefreshTarget と形が似ているが、
+/// 「active な repo に紐付き」「fetched_at + ttl_secs <= now」だけを抽出する点が異なる。
+pub struct StaleEntry {
+    pub cache_key: String,
+    pub argv_json: String,
+    pub kind: String,
+    pub ttl_secs: u64,
+}
+
+/// `ratelimit_state` シングルロー テーブルの読み出し結果。chd プロセス内の
+/// `GlobalLimiter` 状態 + 直近サンプリングした GitHub 側 remaining。
+#[derive(Debug, Clone)]
+pub struct RatelimitState {
+    pub bucket_tokens: f64,
+    pub bucket_capacity: u32,
+    pub refill_per_sec: f64,
+    pub paused: bool,
+    pub remaining: Option<u32>,
+    pub remaining_at: Option<u64>,
+    pub consumed_total: u64,
+    pub enqueued_total: u64,
+    pub skipped_total: u64,
+    pub updated_at: u64,
+}
+
 /// async_passthrough モードで daemon が gh を実行して失敗したときの記録。
 /// stdout/stderr は大き過ぎると DB を圧迫するので保存時に 64KiB で頭打ちにする。
 pub struct ExecError {
@@ -267,6 +293,115 @@ impl Store {
         Ok(n)
     }
 
+    /// Warmer 対象。TTL 切れかつ active な repo に紐付くキャッシュエントリを古い順に最大 `limit` 件返す。
+    /// `repo IS NULL` のエントリは active 判定不可 + chd の cwd で gh を回せないため除外する。
+    pub fn stale_entries(
+        &self,
+        now: u64,
+        active_within_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<StaleEntry>> {
+        let active_threshold = now.saturating_sub(active_within_secs);
+        let mut stmt = self.conn.prepare(
+            "SELECT c.key, c.argv_json, c.kind, c.ttl_secs \
+             FROM cache c \
+             INNER JOIN repo_activity r ON c.repo = r.repo \
+             WHERE c.repo IS NOT NULL \
+               AND c.fetched_at + c.ttl_secs <= ?1 \
+               AND r.last_used > ?2 \
+             ORDER BY (c.fetched_at + c.ttl_secs) ASC \
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![now as i64, active_threshold as i64, limit as i64],
+                |r| {
+                    Ok(StaleEntry {
+                        cache_key: r.get(0)?,
+                        argv_json: r.get(1)?,
+                        kind: r.get(2)?,
+                        ttl_secs: r.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `ratelimit_state` シングルロー upsert。`remaining` / `remaining_at` は
+    /// Some のときだけ書き換え、None なら既存値を保つ（Warmer ティックと headroom sampler の
+    /// 書き込みタイミングがズレてもサンプリング値を上書きで消さないようにするため）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_ratelimit_state(
+        &self,
+        bucket_tokens: f64,
+        bucket_capacity: u32,
+        refill_per_sec: f64,
+        paused: bool,
+        remaining: Option<u32>,
+        remaining_at: Option<u64>,
+        consumed_total: u64,
+        enqueued_total: u64,
+        skipped_total: u64,
+        updated_at: u64,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO ratelimit_state \
+                (id, bucket_tokens, bucket_capacity, refill_per_sec, paused, \
+                 remaining, remaining_at, consumed_total, enqueued_total, skipped_total, updated_at) \
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(id) DO UPDATE SET \
+                bucket_tokens   = excluded.bucket_tokens, \
+                bucket_capacity = excluded.bucket_capacity, \
+                refill_per_sec  = excluded.refill_per_sec, \
+                paused          = excluded.paused, \
+                remaining       = COALESCE(excluded.remaining, ratelimit_state.remaining), \
+                remaining_at    = COALESCE(excluded.remaining_at, ratelimit_state.remaining_at), \
+                consumed_total  = excluded.consumed_total, \
+                enqueued_total  = excluded.enqueued_total, \
+                skipped_total   = excluded.skipped_total, \
+                updated_at      = excluded.updated_at",
+        )?;
+        stmt.execute(params![
+            bucket_tokens,
+            bucket_capacity as i64,
+            refill_per_sec,
+            paused as i64,
+            remaining.map(|x| x as i64),
+            remaining_at.map(|x| x as i64),
+            consumed_total as i64,
+            enqueued_total as i64,
+            skipped_total as i64,
+            updated_at as i64,
+        ])?;
+        Ok(())
+    }
+
+    pub fn get_ratelimit_state(&self) -> Result<Option<RatelimitState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT bucket_tokens, bucket_capacity, refill_per_sec, paused, \
+                    remaining, remaining_at, consumed_total, enqueued_total, skipped_total, updated_at \
+             FROM ratelimit_state WHERE id = 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(RatelimitState {
+                bucket_tokens: row.get(0)?,
+                bucket_capacity: row.get::<_, i64>(1)? as u32,
+                refill_per_sec: row.get(2)?,
+                paused: row.get::<_, i64>(3)? != 0,
+                remaining: row.get::<_, Option<i64>>(4)?.map(|x| x as u32),
+                remaining_at: row.get::<_, Option<i64>>(5)?.map(|x| x as u64),
+                consumed_total: row.get::<_, i64>(6)? as u64,
+                enqueued_total: row.get::<_, i64>(7)? as u64,
+                skipped_total: row.get::<_, i64>(8)? as u64,
+                updated_at: row.get::<_, i64>(9)? as u64,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 直近 `within_secs` 秒以内に触られた repo を新しい順で返す（プリフェッチ対象）。
     pub fn active_repos(&self, within_secs: u64, now: u64) -> Result<Vec<(String, u64)>> {
         let threshold = now.saturating_sub(within_secs);
@@ -339,6 +474,23 @@ CREATE TABLE IF NOT EXISTS exec_errors (
     failed_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_exec_errors_failed_at ON exec_errors(failed_at);
+
+-- spec §10 / §9 [ratelimit]: GlobalLimiter のスナップショット + headroom 状態。
+-- chd プロセス内のメモリが真の在処で、ここは CLI 側 (`ch daemon status`) から読むためのミラー。
+-- 常に id=1 の 1 行のみ。
+CREATE TABLE IF NOT EXISTS ratelimit_state (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    bucket_tokens   REAL    NOT NULL,
+    bucket_capacity INTEGER NOT NULL,
+    refill_per_sec  REAL    NOT NULL,
+    paused          INTEGER NOT NULL DEFAULT 0,
+    remaining       INTEGER,
+    remaining_at    INTEGER,
+    consumed_total  INTEGER NOT NULL DEFAULT 0,
+    enqueued_total  INTEGER NOT NULL DEFAULT 0,
+    skipped_total   INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL
+);
 "#;
 
 /// exec_errors に保存する stdout/stderr の上限。
@@ -565,6 +717,94 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0, "a/b");
         assert_eq!(all[1].0, "old/repo");
+    }
+
+    #[test]
+    fn stale_entries_returns_only_ttl_expired_and_active() {
+        let s = make_store();
+        let mk = |kind: &str, repo: Option<&str>, fetched_at: u64, ttl: u64| Entry {
+            argv_json: "[]".into(),
+            kind: kind.into(),
+            repo: repo.map(Into::into),
+            body: b"x".to_vec(),
+            fetched_at,
+            ttl_secs: ttl,
+        };
+
+        // now=1000、active 窓 200s → threshold=800。
+        s.mark_active("a/b", 900).unwrap(); // active
+        s.mark_active("c/d", 900).unwrap(); // active
+        s.mark_active("x/y", 100).unwrap(); // inactive (古い)
+
+        s.put("k1", &mk("issue_view", Some("a/b"), 800, 60)).unwrap(); // 期限 860 → stale ✓
+        s.put("k2", &mk("issue_view", Some("c/d"), 990, 60)).unwrap(); // 期限 1050 → fresh ✗
+        s.put("k3", &mk("issue_view", Some("x/y"), 800, 60)).unwrap(); // stale だが inactive ✗
+        s.put("k4", &mk("issue_view", None, 800, 60)).unwrap();        // repo NULL ✗
+
+        let stale = s.stale_entries(1000, 200, 10).unwrap();
+        let keys: Vec<&str> = stale.iter().map(|e| e.cache_key.as_str()).collect();
+        assert_eq!(keys, vec!["k1"]);
+        assert_eq!(stale[0].kind, "issue_view");
+        assert_eq!(stale[0].ttl_secs, 60);
+    }
+
+    #[test]
+    fn stale_entries_orders_by_expiry_and_respects_limit() {
+        let s = make_store();
+        s.mark_active("a/b", 900).unwrap();
+
+        let mk = |fetched_at: u64, ttl: u64| Entry {
+            argv_json: "[]".into(),
+            kind: "issue_view".into(),
+            repo: Some("a/b".into()),
+            body: b"x".to_vec(),
+            fetched_at,
+            ttl_secs: ttl,
+        };
+        s.put("late", &mk(800, 100)).unwrap(); // expiry 900
+        s.put("early", &mk(500, 100)).unwrap(); // expiry 600
+        s.put("middle", &mk(700, 100)).unwrap(); // expiry 800
+
+        let stale = s.stale_entries(1000, 200, 2).unwrap();
+        assert_eq!(stale.len(), 2);
+        assert_eq!(stale[0].cache_key, "early");
+        assert_eq!(stale[1].cache_key, "middle");
+    }
+
+    #[test]
+    fn ratelimit_state_upsert_preserves_remaining_when_none() {
+        let s = make_store();
+        s.upsert_ratelimit_state(120.0, 120, 2.0, false, Some(4000), Some(100), 1, 2, 0, 100)
+            .unwrap();
+        let got = s.get_ratelimit_state().unwrap().unwrap();
+        assert_eq!(got.remaining, Some(4000));
+        assert_eq!(got.remaining_at, Some(100));
+        assert!(!got.paused);
+
+        // 二回目: remaining=None → 既存の 4000 / 100 を保つ
+        s.upsert_ratelimit_state(118.0, 120, 2.0, true, None, None, 5, 8, 3, 200)
+            .unwrap();
+        let got = s.get_ratelimit_state().unwrap().unwrap();
+        assert_eq!(got.remaining, Some(4000));
+        assert_eq!(got.remaining_at, Some(100));
+        assert!(got.paused);
+        assert_eq!(got.bucket_tokens, 118.0);
+        assert_eq!(got.consumed_total, 5);
+        assert_eq!(got.enqueued_total, 8);
+        assert_eq!(got.skipped_total, 3);
+        assert_eq!(got.updated_at, 200);
+    }
+
+    #[test]
+    fn ratelimit_state_upsert_overwrites_remaining_when_some() {
+        let s = make_store();
+        s.upsert_ratelimit_state(120.0, 120, 2.0, false, Some(4000), Some(100), 0, 0, 0, 100)
+            .unwrap();
+        s.upsert_ratelimit_state(120.0, 120, 2.0, false, Some(300), Some(200), 0, 0, 0, 200)
+            .unwrap();
+        let got = s.get_ratelimit_state().unwrap().unwrap();
+        assert_eq!(got.remaining, Some(300));
+        assert_eq!(got.remaining_at, Some(200));
     }
 
     #[test]

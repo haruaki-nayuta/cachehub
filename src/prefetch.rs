@@ -21,6 +21,7 @@ use std::process::{Command, Stdio};
 
 use crate::exec::{build_entry, epoch_secs};
 use crate::key;
+use crate::limiter;
 use crate::router::{self, Action};
 use crate::store::Store;
 
@@ -42,8 +43,18 @@ pub fn run(list_argv: &[String], cwd: &str) -> Result<()> {
 
     let store = Store::open_default()?;
     let repo_tok = repo_tokens(list_argv);
+    let limiter = limiter::global();
 
     for number in numbers.into_iter().take(PREFETCH_LIMIT) {
+        // GlobalLimiter のトークンを取れなければ今回の list 起点プリフェッチは打ち切る。
+        // - paused（headroom 低）→ 残り全部スキップが正
+        // - バケット枯れ → 1 件先頭で弾かれて以降全部弾かれるはず。break で揃える
+        // - 未初期化（テスト等）→ 通す
+        if let Some(l) = limiter.as_deref() {
+            if !l.try_acquire() {
+                break;
+            }
+        }
         let view_argv = build_view_argv(number, &repo_tok);
         if let Err(e) = prefetch_one(&store, &view_argv, cwd) {
             // 1 件の失敗で全体を止めない（レート制限などは次回の list に任せる）

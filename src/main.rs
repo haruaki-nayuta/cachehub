@@ -19,9 +19,11 @@ mod exec;
 mod invalidate;
 mod ipc;
 mod key;
+mod limiter;
 mod prefetch;
 mod router;
 mod store;
+mod warmer;
 
 use anyhow::Result;
 use std::env;
