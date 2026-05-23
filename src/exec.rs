@@ -65,6 +65,13 @@ pub fn handle_read(
     ttl: u64,
     cfg: &Config,
 ) -> Result<i32> {
+    // cwd の git remote から `--repo owner/name` を解決して argv に焼き込む（issue #20）。
+    // これで cache.repo / repo_activity の identity が揃い、Warmer の対象に乗る。
+    // chd は cwd が違うので、ここ（CLI 側）で解決して argv_json に残すのが要点。
+    // 解決失敗時は argv をそのまま使う = 従来挙動。
+    let augmented = key::augment_argv_with_repo(argv);
+    let argv = augmented.as_slice();
+
     let k = key::cache_key(argv);
     let now = epoch_secs();
 
@@ -126,6 +133,13 @@ pub(crate) fn build_entry(
 /// Write 経路。gh を透過で実行し、成功時のみ invalidate。
 /// config.async_passthrough が true なら daemon に投げて即 0 を返す（fire-and-forget）。
 pub fn handle_write(store: &Store, argv: &[String], cfg: &Config) -> Result<i32> {
+    // Read 側と同じく cwd の git remote から `--repo` を補う（issue #20）。
+    // mark_active / invalidate が拾う repo identity を Read 側と揃えるため必要。
+    // これがズレると `ch issue close 1`（cwd 解決）の後に
+    // `ch issue view 1`（cwd 解決）の cache が drop されずに stale が残る。
+    let augmented = key::augment_argv_with_repo(argv);
+    let argv = augmented.as_slice();
+
     // Write も「触ったリポ」なので LRU を更新
     let now = epoch_secs();
     mark_active(store, argv, now).ok();
